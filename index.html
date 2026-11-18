@@ -9,11 +9,15 @@
     html, body {
       height: 100%; margin: 0; background: #0b0b10; color: #fff;
       font-family: system-ui, -apple-system, Segoe UI, sans-serif;
-      overflow: hidden;
+      overflow: hidden; touch-action: none;
     }
     #stage { position: fixed; inset: 0; }
-    video { width: 100%; height: 100%; object-fit: cover; background: #000; display: none; }
-    video.mirror { transform: scaleX(-1); }
+
+    /* Hidden source video (kept "visible" to the browser so frames keep updating) */
+    #video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+    #out { width: 100%; height: 100%; object-fit: cover; display: none; background: #000; }
+    #out.mirror { transform: scaleX(-1); }
 
     #intro {
       position: absolute; inset: 0; display: flex; flex-direction: column;
@@ -26,26 +30,36 @@
 
     button {
       font: inherit; color: #fff; background: #5b5bf0; border: 0;
-      padding: 14px 26px; border-radius: 999px; cursor: pointer; font-weight: 600;
+      padding: 12px 20px; border-radius: 999px; cursor: pointer; font-weight: 600;
     }
     button.secondary { background: rgba(255,255,255,.16); backdrop-filter: blur(8px); }
     button:active { transform: scale(.97); }
 
-    #bar {
-      position: absolute; left: 0; right: 0; bottom: 0;
-      display: none; justify-content: center; gap: 10px;
-      padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+    #hint {
+      position: absolute; top: calc(14px + env(safe-area-inset-top)); left: 50%;
+      transform: translateX(-50%); max-width: 90%;
+      background: rgba(0,0,0,.6); padding: 8px 14px; border-radius: 12px;
+      font-size: 14px; text-align: center; display: none; pointer-events: none;
     }
     #info {
-      position: absolute; top: calc(8px + env(safe-area-inset-top)); left: 12px;
-      font-size: 12px; opacity: .7; display: none;
-      background: rgba(0,0,0,.4); padding: 4px 8px; border-radius: 6px;
+      position: absolute; bottom: calc(110px + env(safe-area-inset-bottom)); left: 12px;
+      font-size: 11px; opacity: .6; display: none;
     }
+    #panel {
+      position: absolute; left: 0; right: 0; bottom: 0; display: none;
+      flex-direction: column; align-items: center; gap: 10px;
+      padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+      background: linear-gradient(transparent, rgba(0,0,0,.65));
+    }
+    #sliderRow { display: flex; align-items: center; gap: 10px; font-size: 13px; width: min(420px, 92%); }
+    #sliderRow input { flex: 1; accent-color: #5b5bf0; }
+    #bar { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
   </style>
 </head>
 <body>
   <div id="stage">
     <video id="video" playsinline muted autoplay></video>
+    <canvas id="out"></canvas>
 
     <div id="intro">
       <h1>Singularity</h1>
@@ -54,43 +68,137 @@
       <div id="error"></div>
     </div>
 
+    <div id="hint"></div>
     <div id="info"></div>
 
-    <div id="bar">
-      <button id="flipBtn" class="secondary">Switch camera</button>
-      <button id="stopBtn" class="secondary">Stop</button>
+    <div id="panel">
+      <div id="sliderRow">
+        <span>Sensitivity</span>
+        <input id="sens" type="range" min="0" max="100" value="70">
+      </div>
+      <div id="bar">
+        <button id="bgBtn">Set background</button>
+        <button id="viewBtn" class="secondary">View: Cutout</button>
+        <button id="flipBtn" class="secondary">Switch camera</button>
+        <button id="stopBtn" class="secondary">Stop</button>
+      </div>
     </div>
   </div>
 
   <script>
-    const video    = document.getElementById('video');
-    const intro    = document.getElementById('intro');
-    const errorEl  = document.getElementById('error');
-    const bar      = document.getElementById('bar');
-    const info     = document.getElementById('info');
-    const startBtn = document.getElementById('startBtn');
-    const flipBtn  = document.getElementById('flipBtn');
-    const stopBtn  = document.getElementById('stopBtn');
+    // ---------- Elements ----------
+    const video   = document.getElementById('video');
+    const out     = document.getElementById('out');
+    const octx    = out.getContext('2d');
+    const intro   = document.getElementById('intro');
+    const errorEl = document.getElementById('error');
+    const hintEl  = document.getElementById('hint');
+    const info    = document.getElementById('info');
+    const panel   = document.getElementById('panel');
+    const startBtn= document.getElementById('startBtn');
+    const bgBtn   = document.getElementById('bgBtn');
+    const viewBtn = document.getElementById('viewBtn');
+    const flipBtn = document.getElementById('flipBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const sens    = document.getElementById('sens');
 
+    // ---------- State ----------
     let stream = null;
-    let facing = 'user';   // 'user' = front/webcam, 'environment' = back camera
+    let facing = 'user';
+    let bg = null;               // Float32Array of the empty-scene reference (RGB)
+    let capturing = false;
+    let mode = 0;                // 0 = cutout, 1 = matte, 2 = camera
+    const MODES = ['Cutout', 'Matte', 'Camera'];
+    let hintTimer = null;
+    let movedFrames = 0;
+
+    // Processing size (small = fast). Output size is set once the camera starts.
+    const PW = 320;
+    let PH = 180, OW = 960, OH = 540;
+
+    const proc   = document.createElement('canvas');
+    const pctx   = proc.getContext('2d', { willReadFrequently: true });
+    const matteC = document.createElement('canvas');
+    const mctx   = matteC.getContext('2d');
+    const fgC    = document.createElement('canvas');
+    const fctx   = fgC.getContext('2d');
+
+    let matteImg, rawA, tmpA, blurA, checker;
+
+    // ---------- Helpers ----------
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    function setHint(text, ms) {
+      clearTimeout(hintTimer);
+      if (!text) { hintEl.style.display = 'none'; return; }
+      hintEl.textContent = text;
+      hintEl.style.display = 'block';
+      if (ms) hintTimer = setTimeout(() => hintEl.style.display = 'none', ms);
+    }
 
     function showError(msg) {
       errorEl.textContent = msg;
       intro.style.display = 'flex';
-      video.style.display = 'none';
-      bar.style.display = 'none';
+      out.style.display = 'none';
+      panel.style.display = 'none';
       info.style.display = 'none';
+      setHint('');
     }
 
     function stopCamera() {
-      if (stream) {
-        stream.getTracks().forEach(t => t.stop());
-        stream = null;
-      }
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
       video.srcObject = null;
+      bg = null;
+      capturing = false;
     }
 
+    function setupBuffers(vw, vh) {
+      PH = Math.round(PW * vh / vw);
+      OW = Math.min(vw, 960);
+      OH = Math.round(OW * vh / vw);
+
+      proc.width = PW;  proc.height = PH;
+      matteC.width = PW; matteC.height = PH;
+      fgC.width = OW;   fgC.height = OH;
+      out.width = OW;   out.height = OH;
+
+      matteImg = mctx.createImageData(PW, PH);
+      const n = PW * PH;
+      rawA = new Float32Array(n);
+      tmpA = new Float32Array(n);
+      blurA = new Float32Array(n);
+
+      // Checkerboard backdrop so the cutout is easy to see
+      const c = document.createElement('canvas');
+      c.width = c.height = 40;
+      const x = c.getContext('2d');
+      x.fillStyle = '#16161e'; x.fillRect(0, 0, 40, 40);
+      x.fillStyle = '#1d1d27'; x.fillRect(0, 0, 20, 20); x.fillRect(20, 20, 20, 20);
+      checker = octx.createPattern(c, 'repeat');
+    }
+
+    // 3x3 separable box blur on a Float32Array
+    function blur3(src, dst, tmp, w, h) {
+      for (let y = 0; y < h; y++) {
+        const r = y * w;
+        for (let x = 0; x < w; x++) {
+          const a = src[r + (x > 0 ? x - 1 : 0)];
+          const b = src[r + x];
+          const c = src[r + (x < w - 1 ? x + 1 : w - 1)];
+          tmp[r + x] = (a + b + c) / 3;
+        }
+      }
+      for (let y = 0; y < h; y++) {
+        const up = (y > 0 ? y - 1 : 0) * w;
+        const mid = y * w;
+        const dn = (y < h - 1 ? y + 1 : h - 1) * w;
+        for (let x = 0; x < w; x++) {
+          dst[mid + x] = (tmp[up + x] + tmp[mid + x] + tmp[dn + x]) / 3;
+        }
+      }
+    }
+
+    // ---------- Camera ----------
     async function startCamera() {
       errorEl.textContent = '';
       stopCamera();
@@ -102,11 +210,7 @@
 
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: facing },
-            width:  { ideal: 1280 },
-            height: { ideal: 720 }
-          },
+          video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 } },
           audio: false
         });
       } catch (e) {
@@ -120,25 +224,143 @@
       video.srcObject = stream;
       await video.play();
 
-      // Mirror selfie cameras so it behaves like a mirror. Don't mirror the back camera.
-      const settings = stream.getVideoTracks()[0].getSettings();
-      const isBack = settings.facingMode === 'environment';
-      video.classList.toggle('mirror', !isBack);
+      const s = stream.getVideoTracks()[0].getSettings();
+      const vw = video.videoWidth || s.width || 1280;
+      const vh = video.videoHeight || s.height || 720;
+      setupBuffers(vw, vh);
 
-      info.textContent = settings.width + ' x ' + settings.height;
+      const isBack = s.facingMode === 'environment';
+      out.classList.toggle('mirror', !isBack);
+      info.textContent = vw + ' x ' + vh;
 
       intro.style.display = 'none';
-      video.style.display = 'block';
-      bar.style.display = 'flex';
+      out.style.display = 'block';
+      panel.style.display = 'flex';
       info.style.display = 'block';
 
-      // Only show the switch button if the device has more than one camera
       const devices = await navigator.mediaDevices.enumerateDevices();
       const cams = devices.filter(d => d.kind === 'videoinput');
       flipBtn.style.display = cams.length > 1 ? 'inline-block' : 'none';
+
+      bg = null;
+      setHint('Point at your scene and keep it empty. Rest the device on something steady, then tap "Set background".');
     }
 
+    // ---------- Background capture ----------
+    async function setBackground() {
+      if (!stream || capturing) return;
+      capturing = true;
+      bg = null;
+      movedFrames = 0;
+
+      for (let sec = 3; sec > 0; sec--) {
+        setHint('Keep the frame empty... ' + sec);
+        await sleep(1000);
+        if (!stream) { capturing = false; return; }
+      }
+      setHint('Capturing...');
+
+      const n = PW * PH;
+      const acc = new Float32Array(n * 3);
+      const FRAMES = 12;
+      for (let f = 0; f < FRAMES; f++) {
+        if (!stream) { capturing = false; return; }
+        pctx.drawImage(video, 0, 0, PW, PH);
+        const d = pctx.getImageData(0, 0, PW, PH).data;
+        for (let i = 0, j = 0, k = 0; i < n; i++, j += 4, k += 3) {
+          acc[k] += d[j]; acc[k + 1] += d[j + 1]; acc[k + 2] += d[j + 2];
+        }
+        await sleep(40);
+      }
+      for (let k = 0; k < acc.length; k++) acc[k] /= FRAMES;
+
+      bg = acc;
+      capturing = false;
+      setHint('Done. Now put your hand (or any object) in the frame.', 4000);
+    }
+
+    // ---------- Per-frame cutout ----------
+    function computeMatte() {
+      const n = PW * PH;
+      pctx.drawImage(video, 0, 0, PW, PH);
+      const d = pctx.getImageData(0, 0, PW, PH).data;
+
+      // Sensitivity 0..100  ->  threshold 60..10 (higher sensitivity = lower threshold)
+      const thr = 60 - Number(sens.value) * 0.5;
+
+      for (let i = 0, j = 0, k = 0; i < n; i++, j += 4, k += 3) {
+        const diff = (Math.abs(d[j]     - bg[k]) +
+                      Math.abs(d[j + 1] - bg[k + 1]) +
+                      Math.abs(d[j + 2] - bg[k + 2])) / 3;
+        let a = (diff - thr) / thr;
+        rawA[i] = a < 0 ? 0 : (a > 1 ? 255 : a * 255);
+      }
+
+      // Two blur passes remove speckle and fill tiny holes
+      blur3(rawA, blurA, tmpA, PW, PH);
+      blur3(blurA, rawA, tmpA, PW, PH);
+
+      // Contrast curve around 50% gives a clean but softly-edged matte
+      const md = matteImg.data;
+      let fgCount = 0;
+      for (let i = 0, j = 0; i < n; i++, j += 4) {
+        let a = (rawA[i] - 128) * 2.2 + 128;
+        a = a < 0 ? 0 : (a > 255 ? 255 : a);
+        md[j] = md[j + 1] = md[j + 2] = 255;
+        md[j + 3] = a;
+        if (a > 128) fgCount++;
+      }
+      mctx.putImageData(matteImg, 0, 0);
+
+      // If most of the frame looks like "object", the camera probably moved
+      if (fgCount / n > 0.6) movedFrames++; else movedFrames = 0;
+      if (movedFrames === 45) setHint('Most of the frame changed. Did the camera move or the light change? Tap "Set background" again.', 5000);
+    }
+
+    function render() {
+      if (mode === 2 || !bg) {
+        octx.drawImage(video, 0, 0, OW, OH);
+        return;
+      }
+
+      computeMatte();
+
+      if (mode === 1) {
+        octx.fillStyle = '#000';
+        octx.fillRect(0, 0, OW, OH);
+        octx.imageSmoothingEnabled = true;
+        octx.drawImage(matteC, 0, 0, OW, OH);
+        return;
+      }
+
+      // Cutout: video masked by the matte, over the checkerboard
+      fctx.globalCompositeOperation = 'source-over';
+      fctx.clearRect(0, 0, OW, OH);
+      fctx.drawImage(video, 0, 0, OW, OH);
+      fctx.globalCompositeOperation = 'destination-in';
+      fctx.imageSmoothingEnabled = true;
+      fctx.drawImage(matteC, 0, 0, OW, OH);
+      fctx.globalCompositeOperation = 'source-over';
+
+      octx.fillStyle = checker;
+      octx.fillRect(0, 0, OW, OH);
+      octx.drawImage(fgC, 0, 0);
+    }
+
+    function loop() {
+      requestAnimationFrame(loop);
+      if (!stream || video.readyState < 2 || !out.width) return;
+      render();
+    }
+    requestAnimationFrame(loop);
+
+    // ---------- Buttons ----------
     startBtn.addEventListener('click', startCamera);
+    bgBtn.addEventListener('click', setBackground);
+    viewBtn.addEventListener('click', () => {
+      mode = (mode + 1) % MODES.length;
+      viewBtn.textContent = 'View: ' + MODES[mode];
+    });
     flipBtn.addEventListener('click', () => {
       facing = facing === 'user' ? 'environment' : 'user';
       startCamera();
@@ -146,9 +368,10 @@
     stopBtn.addEventListener('click', () => {
       stopCamera();
       intro.style.display = 'flex';
-      video.style.display = 'none';
-      bar.style.display = 'none';
+      out.style.display = 'none';
+      panel.style.display = 'none';
       info.style.display = 'none';
+      setHint('');
     });
   </script>
 </body>

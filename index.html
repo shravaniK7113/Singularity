@@ -4,9 +4,152 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Singularity</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      height: 100%; margin: 0; background: #0b0b10; color: #fff;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      overflow: hidden;
+    }
+    #stage { position: fixed; inset: 0; }
+    video { width: 100%; height: 100%; object-fit: cover; background: #000; display: none; }
+    video.mirror { transform: scaleX(-1); }
+
+    #intro {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 14px;
+      padding: 24px; text-align: center;
+    }
+    #intro h1 { margin: 0; font-size: 2rem; }
+    #intro p { margin: 0; opacity: .7; max-width: 32ch; }
+    #error { color: #ff8a8a; min-height: 1.2em; max-width: 36ch; }
+
+    button {
+      font: inherit; color: #fff; background: #5b5bf0; border: 0;
+      padding: 14px 26px; border-radius: 999px; cursor: pointer; font-weight: 600;
+    }
+    button.secondary { background: rgba(255,255,255,.16); backdrop-filter: blur(8px); }
+    button:active { transform: scale(.97); }
+
+    #bar {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      display: none; justify-content: center; gap: 10px;
+      padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+    }
+    #info {
+      position: absolute; top: calc(8px + env(safe-area-inset-top)); left: 12px;
+      font-size: 12px; opacity: .7; display: none;
+      background: rgba(0,0,0,.4); padding: 4px 8px; border-radius: 6px;
+    }
+  </style>
 </head>
-<body style="font-family:system-ui;text-align:center;padding:3rem 1rem">
-  <h1>Singularity</h1>
-  <p>Reach in here. Come out there.</p>
+<body>
+  <div id="stage">
+    <video id="video" playsinline muted autoplay></video>
+
+    <div id="intro">
+      <h1>Singularity</h1>
+      <p>Reach in here. Come out there.</p>
+      <button id="startBtn">Start camera</button>
+      <div id="error"></div>
+    </div>
+
+    <div id="info"></div>
+
+    <div id="bar">
+      <button id="flipBtn" class="secondary">Switch camera</button>
+      <button id="stopBtn" class="secondary">Stop</button>
+    </div>
+  </div>
+
+  <script>
+    const video    = document.getElementById('video');
+    const intro    = document.getElementById('intro');
+    const errorEl  = document.getElementById('error');
+    const bar      = document.getElementById('bar');
+    const info     = document.getElementById('info');
+    const startBtn = document.getElementById('startBtn');
+    const flipBtn  = document.getElementById('flipBtn');
+    const stopBtn  = document.getElementById('stopBtn');
+
+    let stream = null;
+    let facing = 'user';   // 'user' = front/webcam, 'environment' = back camera
+
+    function showError(msg) {
+      errorEl.textContent = msg;
+      intro.style.display = 'flex';
+      video.style.display = 'none';
+      bar.style.display = 'none';
+      info.style.display = 'none';
+    }
+
+    function stopCamera() {
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      video.srcObject = null;
+    }
+
+    async function startCamera() {
+      errorEl.textContent = '';
+      stopCamera();
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showError('Camera is not available here. Open the page over https.');
+        return;
+      }
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: facing },
+            width:  { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+      } catch (e) {
+        if (e.name === 'NotAllowedError')       showError('Camera permission was denied. Allow it in your browser settings and try again.');
+        else if (e.name === 'NotFoundError')    showError('No camera found on this device.');
+        else if (e.name === 'NotReadableError') showError('The camera is being used by another app. Close it and try again.');
+        else                                    showError('Could not open the camera: ' + e.name);
+        return;
+      }
+
+      video.srcObject = stream;
+      await video.play();
+
+      // Mirror selfie cameras so it behaves like a mirror. Don't mirror the back camera.
+      const settings = stream.getVideoTracks()[0].getSettings();
+      const isBack = settings.facingMode === 'environment';
+      video.classList.toggle('mirror', !isBack);
+
+      info.textContent = settings.width + ' x ' + settings.height;
+
+      intro.style.display = 'none';
+      video.style.display = 'block';
+      bar.style.display = 'flex';
+      info.style.display = 'block';
+
+      // Only show the switch button if the device has more than one camera
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cams = devices.filter(d => d.kind === 'videoinput');
+      flipBtn.style.display = cams.length > 1 ? 'inline-block' : 'none';
+    }
+
+    startBtn.addEventListener('click', startCamera);
+    flipBtn.addEventListener('click', () => {
+      facing = facing === 'user' ? 'environment' : 'user';
+      startCamera();
+    });
+    stopBtn.addEventListener('click', () => {
+      stopCamera();
+      intro.style.display = 'flex';
+      video.style.display = 'none';
+      bar.style.display = 'none';
+      info.style.display = 'none';
+    });
+  </script>
 </body>
 </html>
